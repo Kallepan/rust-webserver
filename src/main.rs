@@ -1,9 +1,10 @@
-use rust_webserver::{debug, error, info};
+use rust_webserver::{debug, error, info, router::router::Router, thread::ThreadPool, warn};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
+    sync::Arc,
 };
 struct Config {
     address: String,
@@ -11,20 +12,19 @@ struct Config {
     path_to_resources: PathBuf,
 }
 
-enum HTTPStatus {
-    Ok,
+#[derive(Debug)]
+enum HTTPError {
     InvalidRequest,
     NotFound,
 }
 
-fn get_status_line_and_file_from_http_status(error: HTTPStatus) -> (&'static str, &'static str) {
+fn get_status_line_and_file_from_http_status(error: HTTPError) -> (&'static str, &'static str) {
     /*
     Get the status line and file path for a given HTTP status.
      */
     match error {
-        HTTPStatus::Ok => ("HTTP/1.1 200 OK", "index.html"),
-        HTTPStatus::InvalidRequest => ("HTTP/1.1 400 Bad Request", "400.html"),
-        HTTPStatus::NotFound => ("HTTP/1.1 404 Not Found", "404.html"),
+        HTTPError::InvalidRequest => ("HTTP/1.1 400 Bad Request", "400.html"),
+        HTTPError::NotFound => ("HTTP/1.1 404 Not Found", "404.html"),
     }
 }
 
@@ -54,21 +54,25 @@ fn get_config() -> Config {
     }
 }
 
-fn validate_request(request: BufReader<&TcpStream>) -> Option<HTTPStatus> {
-    /* Validate the request from the client. */
+fn validate_request(request: BufReader<&TcpStream>) -> Result<(String, String, String), HTTPError> {
+    /* Validate the request from the client.
+     * The request must be a GET request with the HTTP version 1.1.
+     * If the request is valid, return the method, uri, and version.
+     * If the request is invalid, return an error corresponding to the HTTP status code.
+     */
     let request = match request.lines().next() {
         Some(line) => line,
-        None => return None,
+        None => return Err(HTTPError::InvalidRequest),
     };
 
     let request = match request {
         Ok(request) => request,
-        Err(_) => return None,
+        Err(_) => return Err(HTTPError::InvalidRequest),
     };
 
     let parts: Vec<&str> = request.split_whitespace().collect();
     if parts.len() != 3 {
-        return Some(HTTPStatus::InvalidRequest);
+        return Err(HTTPError::InvalidRequest);
     }
 
     let method = parts[0];
@@ -76,18 +80,14 @@ fn validate_request(request: BufReader<&TcpStream>) -> Option<HTTPStatus> {
     let version = parts[2];
 
     if method != "GET" {
-        return Some(HTTPStatus::InvalidRequest);
-    }
-
-    if uri != "/" {
-        return Some(HTTPStatus::NotFound);
+        return Err(HTTPError::InvalidRequest);
     }
 
     if version != "HTTP/1.1" {
-        return Some(HTTPStatus::InvalidRequest);
+        return Err(HTTPError::InvalidRequest);
     }
 
-    Some(HTTPStatus::Ok)
+    Ok((method.to_string(), uri.to_string(), version.to_string()))
 }
 
 fn get_file_contents(path: PathBuf) -> String {
@@ -119,6 +119,7 @@ fn construct_respoonse(status_line: &str, contents: &str) -> String {
 fn handle_connection(
     mut stream: TcpStream,
     config: &Config,
+    router: &Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = stream.peer_addr()?;
     debug!("Connection from {}", addr);
@@ -127,44 +128,53 @@ fn handle_connection(
     let buf_reader = BufReader::new(&stream);
 
     // validate the request
-    match validate_request(buf_reader) {
-        Some(HTTPStatus::Ok) => {
-            let (status_line, file) = get_status_line_and_file_from_http_status(HTTPStatus::Ok);
+    let (method, uri, version) = match validate_request(buf_reader) {
+        Ok((method, uri, version)) => (method, uri, version),
+        Err(e) => {
+            warn!("Error validating request: {:?}", e);
+            let (status_line, file) = get_status_line_and_file_from_http_status(e);
             let contents = get_file_contents(config.path_to_resources.join(file));
             let response = construct_respoonse(status_line, &contents);
             stream.write_all(response.as_bytes())?;
             return Ok(());
         }
-        Some(HTTPStatus::InvalidRequest) => {
-            let (status_line, file) =
-                get_status_line_and_file_from_http_status(HTTPStatus::InvalidRequest);
-            let contents = get_file_contents(config.path_to_resources.join(file));
-            let response = construct_respoonse(status_line, &contents);
-            stream.write_all(response.as_bytes())?;
-            return Ok(());
-        }
-        Some(HTTPStatus::NotFound) => {
-            let (status_line, file) =
-                get_status_line_and_file_from_http_status(HTTPStatus::NotFound);
-            let contents = get_file_contents(config.path_to_resources.join(file));
-            let response = construct_respoonse(status_line, &contents);
-            stream.write_all(response.as_bytes())?;
-            return Ok(());
+    };
+
+    debug!("Request: {} {} {}", method, uri, version);
+    let status_line = "HTTP/1.1 200 OK";
+    let (status_line, file) = match router.get_route(&method, &uri) {
+        Some(handler) => {
+            let file = handler().unwrap();
+            (status_line, file)
         }
         None => {
             let (status_line, file) =
-                get_status_line_and_file_from_http_status(HTTPStatus::InvalidRequest);
-            let contents = get_file_contents(config.path_to_resources.join(file));
-            let response = construct_respoonse(status_line, &contents);
-            stream.write_all(response.as_bytes())?;
-            return Ok(());
+                get_status_line_and_file_from_http_status(HTTPError::NotFound);
+            (status_line, file.to_string())
         }
-    }
+    };
+    let contents = get_file_contents(config.path_to_resources.join(file));
+    let response = construct_respoonse(status_line, &contents);
+    stream.write_all(response.as_bytes())?;
+
+    return Ok(());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // get the configuration for the webserver
-    let config = get_config();
+    let config = Arc::new(get_config());
+
+    // configure the router
+    let mut router = Router::new();
+    router.add_route("GET", "/", || Some("index.html".to_string()));
+    router.add_route("GET", "/sleep", || {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        Some("index.html".to_string())
+    });
+    let router = Arc::new(router);
+
+    // configure the thread pool
+    let thread_pool = ThreadPool::new(4);
 
     // start the webserver
     let listener = TcpListener::bind(format!("{}:{}", config.address, config.port))?;
@@ -180,9 +190,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        if let Err(e) = handle_connection(stream, &config) {
-            error!("Error handling connection: {}", e);
-        }
+        let config = Arc::clone(&config);
+        let router = Arc::clone(&router);
+        thread_pool.execute(move || {
+            if let Err(e) = handle_connection(stream, &config, &router) {
+                error!("Error handling connection: {}", e);
+            }
+        });
     }
 
     Ok(())
