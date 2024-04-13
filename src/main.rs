@@ -198,6 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    info!("Shutting down...");
 
     Ok(())
 }

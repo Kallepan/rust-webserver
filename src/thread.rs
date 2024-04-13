@@ -1,13 +1,13 @@
 use std::{
     sync::{mpsc, Arc, Mutex},
-    thread,
+    thread::{self},
 };
 
 use crate::info;
 
 pub struct ThreadPool {
-    _workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    workers: Vec<Worker>,
+    sender: Option<mpsc::Sender<Job>>,
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -34,8 +34,8 @@ impl ThreadPool {
         }
 
         ThreadPool {
-            _workers: workers,
-            sender,
+            workers,
+            sender: Some(sender),
         }
     }
 
@@ -45,27 +45,50 @@ impl ThreadPool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.as_ref().unwrap().send(job).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        info!("Sending terminate message to all workers.");
+
+        for worker in &mut self.workers {
+            info!("Shutting down worker {}", worker._id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
 
 struct Worker {
     _id: usize,
-    _thread: thread::JoinHandle<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
         let thread = thread::spawn(move || loop {
-            let job = receiver.lock().unwrap().recv().unwrap();
+            let message = receiver.lock().unwrap().recv();
 
-            info!("Worker {} got a job; executing.", id);
-            job();
+            match message {
+                Ok(job) => {
+                    info!("Worker {} got a job; executing.", id);
+                    job();
+                }
+                Err(_) => {
+                    info!("Worker {} is shutting down.", id);
+                    break;
+                }
+            }
         });
 
         Worker {
             _id: id,
-            _thread: thread,
+            thread: Some(thread),
         }
     }
 }
@@ -83,8 +106,16 @@ fn test_worker() {
             info!("This is a test job.");
         }))
         .unwrap();
+    sender
+        .send(Box::new(|| {
+            info!("This is a test job.");
+        }))
+        .unwrap();
 
-    worker._thread.join().unwrap();
+    // stop the worker by dropping the sender
+    drop(sender);
+
+    worker.thread.unwrap().join().unwrap();
 }
 
 #[test]
